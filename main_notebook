@@ -1,0 +1,211 @@
+from groq import Groq
+import json
+import urllib.request
+import xml.etree.ElementTree as ET
+from IPython.display import display, Markdown
+
+
+GROQ_KEY = "ADD_SOME_KEY"
+client = Groq(api_key=GROQ_KEY)
+
+        
+class ArxivTools:
+    
+    def __init__(self):
+        self.cache = {}
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "fetch_arxiv_paper",
+                    "description": "Fetch title, authors and abstract of a paper given its arxiv ID",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "arxiv_id": {"type": "string", "description": "The arxiv ID e.g. 2301.07041"}
+                        },
+                        "required": ["arxiv_id"]
+                    }
+                }
+            },
+            
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_arxiv",
+                   "description": """Search arxiv for academic papers by topic or keyword.
+                    The query parameter must use arxiv API syntax:
+                    - Use abs:"phrase" to search for an exact phrase in abstracts
+                    - Use ti:"phrase" to search for an exact phrase in titles
+                    - Combine multiple terms with AND
+                    Examples:
+                      - abs:"neural networks" AND abs:astronomy
+                      - abs:"transformer" AND abs:"protein folding"
+                      - ti:"diffusion" AND abs:"galaxy formation"
+                    The query should be constructed from the user's request following this syntax.""",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search topic or keyword e.g. 'diffusion models astrophysics'"},
+                            "max_results": {"type": "integer", "description": "Number of results to return, default 3"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }
+        ]
+    
+    def fetch_arxiv_paper(self, arxiv_id):
+        
+        if arxiv_id in self.cache:
+            return self.cache[arxiv_id]
+        url = f"http://export.arxiv.org/api/query?id_list={arxiv_id}"
+        
+        try:
+            response = urllib.request.urlopen(url)
+            xml_data = response.read().decode("utf-8")
+            root = ET.fromstring(xml_data)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            entry = root.find("atom:entry", ns)
+            title = entry.find("atom:title", ns).text.strip()
+            summary = entry.find("atom:summary", ns).text.strip()
+            authors = [a.find("atom:name", ns).text 
+                       for a in entry.findall("atom:author", ns)]
+            author_str = f"{authors[0]} et al." if len(authors) > 1 else authors[0]
+            result = f"Title: {title}\nAuthors: {author_str}\nLink: https://arxiv.org/abs/{arxiv_id}\n{summary}"
+            self.cache[arxiv_id] = result
+            return result
+        except Exception as e:
+            return f"Error: {e}"
+    
+    def search_arxiv(self, query, max_results=10):
+        
+        query = query.replace('"', '').replace("'", '')
+        # Don't blindly replace spaces — only replace spaces that aren't part of AND
+        query_encoded = query.replace(" AND ", "+AND+").replace(" ", "+")
+        url = f"https://export.arxiv.org/api/query?search_query={query_encoded}&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        
+        try:
+            response = urllib.request.urlopen(req)
+            xml_data = response.read().decode("utf-8")
+            root = ET.fromstring(xml_data)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            results = []
+            for entry in root.findall("atom:entry", ns):
+                title = entry.find("atom:title", ns).text.strip()
+                arxiv_id = entry.find("atom:id", ns).text.strip().split("/")[-1]
+                authors = [a.find("atom:name", ns).text 
+                           for a in entry.findall("atom:author", ns)]
+                author_str = f"{authors[0]} et al." if len(authors) > 1 else authors[0]
+                results.append(f"ID: {arxiv_id} | Title: {title} | Authors: {author_str} | Link: https://arxiv.org/abs/{arxiv_id}")
+            if not results:
+                return f"No results found for: {query}"
+            return "\n".join(results)
+        except Exception as e:
+            return f"Error: {e}"
+    
+    
+    def get_dispatcher(self):
+        return {
+            "search_arxiv": self.search_arxiv,
+            "fetch_arxiv_paper": self.fetch_arxiv_paper
+        }
+    
+    
+arxiv_tools = ArxivTools()
+available_tools = arxiv_tools.get_dispatcher()
+tools = arxiv_tools.tools
+
+def run_agent():
+    
+    messages = [
+        {
+            "role": "system",
+            "content": """You are a research assistant that helps find and summarise academic papers.
+CRITICAL RULES:
+- You ALWAYS have access to search_arxiv and fetch_arxiv_paper tools
+- You NEVER generate paper titles from memory
+- You NEVER say you don't have access to tools
+- If search returns no results, tell the user honestly
+- ONLY present papers returned by the search_arxiv tool
+- Inventing paper titles is strictly forbidden"""
+        }
+    ]
+    
+    print("Agent ready. Type 'exit' to quit.\n")
+
+    while True: 
+        user_input = input("You: ")
+        if user_input == "exit":
+            break
+
+        messages.append({"role": "user", "content": user_input})
+        reply = "I could not generate a response. Please try again."
+
+        # First API call
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=tools,
+            temperature=0)
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            messages.append({"role": "assistant", "content": None, "tool_calls": message.tool_calls})
+            for tool_call in message.tool_calls:
+                args = json.loads(tool_call.function.arguments)
+                result = available_tools[tool_call.function.name](**args)
+                print("TOOL RESULT:", result)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result
+                })
+
+            # Loop until model gives a text reply
+            max_iterations = 3
+            iteration = 0
+            while iteration < max_iterations:
+                final = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    tools=tools,
+                    temperature=0) 
+                final_message = final.choices[0].message
+
+                if final_message.tool_calls and iteration < max_iterations - 1:
+                    messages.append({"role": "assistant", "content": None, "tool_calls": final_message.tool_calls})
+                    for tool_call in final_message.tool_calls:
+                        args = json.loads(tool_call.function.arguments)
+                        result = available_tools[tool_call.function.name](**args)
+                        print("TOOL RESULT:", result)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result
+                        })
+                    iteration += 1
+                else:
+                    reply = final_message.content
+                    break
+
+            # Force a reply if model still hasn't given one
+            if not reply or reply == "I could not generate a response. Please try again.":
+                forced = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages + [{"role": "user", "content": "Please present the search results you found above."}],
+                    temperature=0
+                )
+                reply = forced.choices[0].message.content
+        else:
+            reply = message.content or "I could not generate a response. Please try again."
+
+        messages.append({"role": "assistant", "content": reply})
+        display(Markdown(str(reply)))
+
+run_agent()
+
+run_agent()
+# Summarise 2603.26613 
+# Find the 5 most recent papers on diffusion models in astrophysics
